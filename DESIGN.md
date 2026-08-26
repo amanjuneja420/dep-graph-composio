@@ -130,3 +130,12 @@ key becomes available.
 - I did not get to test against a second *real* toolkit catalog (only the hand-written fake
   one) since none was provided in this repo — the fake fixture demonstrates the mechanism
   generalizes, but a real second catalog would be a stronger proof.
+- Known, deliberate recall loss: `ref` (17 GitHub tools require it, e.g. workflow-dispatch
+  endpoints) now has zero producers. It recurs under too many different entity types to clear
+  the distinctiveness bar for bare matching, and consumers spell it bare (no `_` to split on
+  for a qualified match either). This is the direct cost of the precision fixes above — traded
+  deliberately, since the alternative (letting `ref` bare-match broadly again) reintroduces the
+  same kind of noise `repo`/`sha` had. A toolkit-agnostic fix would be to also try qualifying a
+  bare consumer field against the PRODUCER'S OWN inferred entity (e.g. `GITHUB_GET_A_BRANCH`'s
+  output `ref` really is "the branch's ref") rather than only splitting the consumer field —
+  didn't implement it for time.
