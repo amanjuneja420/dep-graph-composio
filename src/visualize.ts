@@ -24,9 +24,15 @@ const graph = JSON.parse(readFileSync(IN_PATH, "utf-8"));
 // ---------------------------------------------------------------------------
 // layout (computed here, in Node, once -- see file header)
 // ---------------------------------------------------------------------------
-type LaidOutNode = { id: string; service?: string; x: number; y: number; degree: number };
+type LaidOutNode = { id: string; service?: string; x: number; y: number; degree: number; r: number; label: boolean };
 
-function computeLayout(nodes: { id: string; service?: string }[], edges: { from: string; to: string }[]): LaidOutNode[] {
+// Single source of truth for node circle radius (Node layout AND browser render both use
+// this so the collision math below and what actually gets drawn never disagree).
+function radiusFor(degree: number): number {
+  return 3 + Math.min(8, Math.sqrt(degree + 1) * 1.7);
+}
+
+function computeLayout(nodes: { id: string; service?: string }[], edges: { from: string; to: string }[]) {
   const N = nodes.length;
   const idx = new Map(nodes.map((n, i) => [n.id, i]));
   const edgeIdx = edges
@@ -35,8 +41,9 @@ function computeLayout(nodes: { id: string; service?: string }[], edges: { from:
 
   const degree = new Array(N).fill(0);
   for (const [a, b] of edgeIdx) { degree[a]++; degree[b]++; }
+  const radius = degree.map(radiusFor);
 
-  const extent = 260 + Math.sqrt(N) * 26; // scales with node count so it isn't a tight ball
+  const extent = 320 + Math.sqrt(N) * 34; // scales with node count so it isn't a tight ball
   const x = new Array(N), y = new Array(N), vx = new Array(N).fill(0), vy = new Array(N).fill(0);
   for (let i = 0; i < N; i++) {
     const angle = (i / N) * Math.PI * 2 + Math.random() * 0.4;
@@ -45,8 +52,8 @@ function computeLayout(nodes: { id: string; service?: string }[], edges: { from:
     y[i] = Math.sin(angle) * r;
   }
 
-  const SPRING_LENGTH = 60;
-  const ITERATIONS = 260;
+  const SPRING_LENGTH = 95;
+  const ITERATIONS = 320;
   for (let iter = 0; iter < ITERATIONS; iter++) {
     const cool = 1 - iter / ITERATIONS; // simulated annealing: big moves early, fine settling late
     for (let i = 0; i < N; i++) {
@@ -55,9 +62,15 @@ function computeLayout(nodes: { id: string; service?: string }[], edges: { from:
         if (i === j) continue;
         const dx = x[i] - x[j], dy = y[i] - y[j];
         const d2 = dx * dx + dy * dy || 0.01;
-        if (d2 > 160000) continue; // 400-unit cutoff keeps this fast without sacrificing spread
+        if (d2 > 250000) continue; // 500-unit cutoff keeps this fast without sacrificing spread
         const d = Math.sqrt(d2);
-        const f = 9000 / d2;
+        // General long-range repulsion, PLUS a much sharper short-range push once circles
+        // would actually overlap on screen (d < combined radius + padding) -- the general
+        // 1/d^2 term alone is too soft at close range to reliably keep touching nodes apart,
+        // which is what was producing visibly overlapping circles.
+        let f = 16000 / d2;
+        const minSep = radius[i] + radius[j] + 14;
+        if (d < minSep) f += (minSep - d) * 40;
         fx += (dx / d) * f; fy += (dy / d) * f;
       }
       vx[i] += fx * cool; vy[i] += fy * cool;
@@ -70,16 +83,45 @@ function computeLayout(nodes: { id: string; service?: string }[], edges: { from:
       vx[b] -= (dx / d) * f; vy[b] -= (dy / d) * f;
     }
     for (let i = 0; i < N; i++) {
-      vx[i] += -x[i] * 0.0008; vy[i] += -y[i] * 0.0008;
+      vx[i] += -x[i] * 0.0007; vy[i] += -y[i] * 0.0007;
       x[i] += vx[i] *= 0.8;
       y[i] += vy[i] *= 0.8;
     }
   }
 
-  return nodes.map((n, i) => ({ id: n.id, service: n.service, x: Math.round(x[i]), y: Math.round(y[i]), degree: degree[i] }));
+  const scale = Math.max(0.15, Math.min(0.85, 700 / extent));
+
+  // Deterministic label decluttering: greedily pick nodes (highest degree first) to always
+  // show a label for, but only accept one if its approximate on-screen text bounding box
+  // (in the SAME projected `scale` the browser opens at) doesn't overlap an already-accepted
+  // label's box. This is computed once, here, against exact final coordinates -- guaranteed
+  // no overlap at the default view, unlike blindly labeling "top N by degree" regardless of
+  // where those N nodes actually ended up relative to each other.
+  const order = [...Array(N).keys()].sort((a, b) => degree[b] - degree[a]);
+  const accepted: { x0: number; y0: number; x1: number; y1: number }[] = [];
+  const labelOk = new Array(N).fill(false);
+  const MAX_LABELS = 40;
+  for (const i of order) {
+    if (accepted.length >= MAX_LABELS) break;
+    const sx = x[i] * scale, sy = y[i] * scale;
+    const fontPx = 9 * scale;
+    const w = fontPx * 0.58 * nodes[i].id.length;
+    const h = fontPx * 1.3;
+    const box = { x0: sx + radius[i] * scale, y0: sy - h / 2, x1: sx + radius[i] * scale + w + 6, y1: sy + h / 2 };
+    const overlaps = accepted.some(
+      (b) => box.x0 < b.x1 && box.x1 > b.x0 && box.y0 < b.y1 && box.y1 > b.y0,
+    );
+    if (!overlaps) { accepted.push(box); labelOk[i] = true; }
+  }
+
+  const laidOut: LaidOutNode[] = nodes.map((n, i) => ({
+    id: n.id, service: n.service, x: Math.round(x[i]), y: Math.round(y[i]),
+    degree: degree[i], r: Math.round(radius[i] * 10) / 10, label: labelOk[i],
+  }));
+  return { nodes: laidOut, scale };
 }
 
-const laidOutNodes = computeLayout(graph.nodes, graph.edges);
+const { nodes: laidOutNodes, scale: initialScale } = computeLayout(graph.nodes, graph.edges);
 
 // ---------------------------------------------------------------------------
 // HTML (browser side does rendering + interaction only, no physics)
@@ -107,7 +149,7 @@ const html = `<!doctype html>
   .edge.dim { stroke-opacity: 0.03; }
   .node circle { stroke: #0a0b0d; stroke-width: 1.2px; cursor: pointer; }
   .node text { fill: #dfe3e8; font-size: 9px; pointer-events: none; opacity: 0; transition: opacity 0.1s; }
-  .node.hub text, .node:hover text, .node.hi text, .node.match text { opacity: 0.9; }
+  .node.label text, .node:hover text, .node.hi text, .node.match text { opacity: 0.9; }
   .node.hi text { fill: #fff; font-weight: 600; }
   .node.dim circle { opacity: 0.15; }
   .node.dim text { opacity: 0 !important; }
@@ -148,8 +190,6 @@ const NS = 'http://www.w3.org/2000/svg';
 const svg = document.querySelector('svg');
 const viewport = document.getElementById('viewport');
 
-const hubThreshold = [...nodes.map(n => n.degree)].sort((a, b) => b - a)[Math.min(14, nodes.length - 1)] ?? Infinity;
-
 const edgeEls = rawEdges.map(e => {
   const a = byId.get(e.from), b = byId.get(e.to);
   const el = document.createElementNS(NS, 'path');
@@ -160,14 +200,14 @@ const edgeEls = rawEdges.map(e => {
 });
 const nodeEls = nodes.map(n => {
   const g = document.createElementNS(NS, 'g');
-  g.setAttribute('class', 'node' + (n.degree >= hubThreshold ? ' hub' : ''));
+  g.setAttribute('class', 'node' + (n.label ? ' label' : ''));
   g.setAttribute('transform', 'translate(' + n.x + ',' + n.y + ')');
   const c = document.createElementNS(NS, 'circle');
-  c.setAttribute('r', String(3 + Math.min(10, Math.sqrt(n.degree + 1) * 2)));
+  c.setAttribute('r', String(n.r));
   c.setAttribute('fill', colorFor(n.service));
   const t = document.createElementNS(NS, 'text');
   t.textContent = n.id;
-  t.setAttribute('x', '7'); t.setAttribute('y', '3');
+  t.setAttribute('x', String(n.r + 4)); t.setAttribute('y', '3');
   g.appendChild(c); g.appendChild(t);
   viewport.appendChild(g);
   g.addEventListener('click', (ev) => { ev.stopPropagation(); highlight(n.id); });
@@ -204,8 +244,10 @@ document.getElementById('search').addEventListener('input', (ev) => {
   }
 });
 
-// pan/zoom
-let tx = 0, ty = 0, scale = Math.max(0.15, Math.min(0.85, 700 / (260 + Math.sqrt(nodes.length) * 26)));
+// pan/zoom -- initial scale must match the value computeLayout() used in src/visualize.ts to
+// pick non-overlapping labels; it's embedded as a literal (not recomputed here) so the two
+// can never drift out of sync.
+let tx = 0, ty = 0, scale = ${initialScale};
 let dragging = false, lastX = 0, lastY = 0, moved = false;
 function applyTransform() { viewport.setAttribute('transform', 'translate(' + tx + ',' + ty + ') scale(' + scale + ')'); }
 tx = window.innerWidth / 2; ty = window.innerHeight / 2;
