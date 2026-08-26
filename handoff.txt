@@ -1,0 +1,141 @@
+HANDOFF — Composio dep-graph assessment
+=========================================
+Written by Claude Code (Sonnet 5) for continuation by any other assistant/session, in case
+this session's usage runs out before the assessment is wrapped up. Plain text, no assumed
+tooling beyond git/node.
+
+WHERE THINGS STAND (current HEAD as of writing this file)
+-----------------------------------------------------------
+Repo: C:\Users\Aman Juneja\Desktop\composio_task\dep-graph
+Branch: master
+Commits so far:
+  2e6f2dc Assessment: initial state          (given)
+  d869b28 Implement heuristic dependency inference in generate()
+  63c2011 Add self-contained graph visualization
+  (+ this session will add one more: final hardening + this handoff file)
+
+The deliverable (generator at src/generate.ts) is FUNCTIONALLY COMPLETE and passes the
+grader's gates:
+  - `npm run selfcheck` -> 893 nodes, 2528 edges, provenance_ratio 1.0, labeled_edges 2528
+  - Both README example chains verified present and correct:
+      GITHUB_LIST_REPOSITORY_ISSUES -> GITHUB_CREATE_AN_ISSUE_COMMENT   (label: issue_number)
+      GITHUB_LIST_PULL_REQUESTS     -> GITHUB_MERGE_A_PULL_REQUEST      (label: pull_number)
+  - graph.html (committed, self-contained, embedded data) renders and is interactive
+    (drag/zoom/search/click-to-highlight) — verified in a real browser this session.
+
+HOW THE GENERATOR WORKS (src/generate.ts)
+-------------------------------------------
+Two-pass design:
+
+1. Heuristic schema matching (deterministic, no network, this is what's actually shipped
+   right now since the LLM pass never got verified live — see "OPEN ISSUE" below):
+   - `extractProducibleFields(tool)` walks a tool's outputParameters (resolving $ref/$defs,
+     including array-item entities like `Issue`/`PullRequest` and one/two levels of nested
+     objects) and registers "qualified" candidate fields, e.g. an `Issue` object's bare
+     `number` property becomes the candidate `issue_number` (because it's inside an
+     Issue-typed context). Generic leaf names (id/number/name/key/node_id/slug) MUST be
+     qualified by an entity to be registered; distinctive leaf names (sha/ref/login/email/
+     tag_name/branch) are registered both bare and qualified.
+   - For fields sitting directly on a tool's response root (e.g. GITHUB_GET_AN_ISSUE's
+     top-level `number`), the entity context comes from scanning the TOOL'S OWN SLUG for
+     known entity keywords (`entitiesFromSlug`), since the wrapper schema's own title
+     (e.g. "GetAnIssueResponse") isn't a reliable entity name.
+   - `ENTITY_ALIASES` maps canonical entities to the short forms Composio/GitHub actually use
+     in parameter names (pull_request -> pull/pr, repository -> repo, organization -> org,
+     etc.) so e.g. a producer's qualified `pull_request_number` also registers as
+     `pull_number`, matching consumers that require exactly `pull_number`.
+   - `extractRequiredInputs(tool)` just reads `inputParameters.required`.
+   - `buildHeuristicEdges` matches each tool's required fields against the producer index,
+     excludes self-loops, and CAPS producers per (consumer, field) at 6 — preferring
+     LIST/GET/SEARCH/FIND-verb tools first (more natural "precursor" actions) — because
+     without a cap, extremely common fields like `repository_id` were matching 1000+
+     producers and drowning the graph in low-value edges (first uncapped attempt: 8515
+     edges; capped: 2528, much more sane signal-to-noise).
+   - `inferService(slug)` reuses `entitiesFromSlug` for the optional Node.service field.
+
+2. LLM refinement (`refineWithLLM`, OPTIONAL, gracefully degrades):
+   - Only runs if `OPENAI_API_KEY` is set in env (also reads `OPENAI_BASE_URL`,
+     `OPENAI_MODEL` — defaults to `openai/gpt-4o`, matches the README's OpenRouter-style
+     instructions).
+   - Batches heuristic candidate edges (10 per batch, capped at DEPGRAPH_LLM_MAX_EDGES=2000
+     total, concurrency 5) grouped with producer/consumer descriptions, and asks the model to
+     confirm/reject each candidate as a real dependency vs. a coincidental field-name match.
+   - `max_tokens` is capped at 200 per batch (verdict JSON is small; see OPEN ISSUE — this
+     was NOT capped in the very first test run and that's what burned the credit budget).
+   - ANY failure (missing key, network error, JSON parse failure, 402, whatever) makes that
+     batch fall back to "keep all candidates as-is" — never crashes, never drops edges due to
+     an LLM hiccup. Logs a per-batch `kept N/M` line and a final summary line
+     (`LLM refinement summary: X/Y kept (Z rejected), W/N batches fell back`).
+   - This has NOT been verified end-to-end with real reject/keep decisions yet (see below).
+
+OPEN ISSUE — LLM refinement pass is unverified live
+------------------------------------------------------
+What happened this session:
+  1. First test run (BEFORE max_tokens was capped) ran ~130/134 batches against the user's
+     real OpenRouter-backed key (base_url https://litmus-production.up.railway.app/proxy/openai/v1,
+     model openai/gpt-4o) and only failed near the end with a 402 "requested up to 16384
+     tokens" credits error. This almost certainly burned most of the assessment's credit
+     budget, since the SDK was defaulting max_tokens to a huge completion ceiling per request
+     across ~130 successful large completions.
+  2. I capped max_tokens (first to 1024, then to 200 after seeing it still failed) and had the
+     user re-run. Second run: ALL 134 batches failed immediately with
+     "402 ... can only afford 8 [tokens]" — i.e. the account's credit balance is now
+     essentially zero, not a bug in the capped code, just a drained budget.
+  3. Every failed batch correctly fell back to keep-as-is (that's the fallback working as
+     designed), so the shipped dependency_graph.json / graph.html are 100% heuristic-only
+     right now (2528 edges, all from pass 1). LLM refinement code is real and wired in, but
+     has never actually returned a real "reject" decision that we've observed — we only know
+     it fails closed correctly.
+
+What the user wants to do: try adding OpenRouter credits themselves later (they said they're
+not sure they can, and there may be a ~10-minute recording window after finishing the
+assessment during which they're unsure if using the key is even intended/safe). Decision made
+this session: SHIP THE HEURISTIC-ONLY GRAPH as the actual submission, keep the LLM pass in the
+code as a documented, best-effort enhancement that will silently activate if a grading
+environment's key has budget, but nothing about passing the grader depends on it working.
+
+IF YOU HAVE A WORKING KEY WITH BUDGET, TO VERIFY THE LLM PASS:
+  cd "C:\Users\Aman Juneja\Desktop\composio_task\dep-graph"
+  export OPENAI_API_KEY="..."          # PowerShell: $env:OPENAI_API_KEY="..."
+  export OPENAI_BASE_URL="..."         # PowerShell: $env:OPENAI_BASE_URL="..."
+  npm run selfcheck
+Look for the "LLM refinement summary: X/Y kept (Z rejected), W/N batches fell back" line.
+If Z (rejected) > 0 and W (failed batches) is low, the pass is genuinely working — regenerate
+graph.html with `npm run visualize` and re-commit both dependency_graph.json's absence
+(it's gitignored on purpose, don't force-add it) and the new graph.html.
+If you want to be extra conservative with a low remaining budget, lower
+DEPGRAPH_LLM_MAX_EDGES (env var, default 2000) to review only a sample first.
+
+FILES
+-----
+  src/generate.ts   — the generator (all real logic lives here)
+  src/visualize.ts  — reads dependency_graph.json, writes self-contained graph.html
+  src/selfcheck.ts  — READ-ONLY grader-provided harness, do not modify
+  graph.html        — COMMITTED visualization snapshot (embeds the graph JSON directly,
+                       since dependency_graph.json itself is gitignored as regenerated output)
+  dependency_graph.json — gitignored, regenerated by `npm run generate -- github_catalog.json`
+                       or `npm run selfcheck`; NOT meant to be committed (grader runs the
+                       generator itself per generator.json)
+  github_catalog.json — provided input, stays committed as-is
+  package.json      — scripts: generate, selfcheck, visualize
+
+REMAINING / OPTIONAL FURTHER WORK (not required to pass, but would deepen the submission)
+--------------------------------------------------------------------------------------------
+  - Verify the LLM refinement pass live (see above) once credits are available, and
+    re-commit the LLM-refined graph.html/summary if it demonstrably improves precision.
+  - Consider testing generate.ts against a second, different toolkit's catalog (not just
+    GitHub) to confirm it truly generalizes as the README requires ("your generator should
+    generalize... it works for any toolkit, not just this one") — no second catalog was
+    provided in this repo, so this would require sourcing one (e.g. another Composio
+    toolkit's tool list) — optional, not blocking.
+  - Manually spot-check a larger random sample of edges (beyond the two README examples) for
+    precision, and consider whether MAX_PRODUCERS_PER_FIELD (currently 6) or the entity
+    alias table should be tuned further based on that review.
+
+HOW TO RUN THE WHOLE THING FRESH
+-----------------------------------
+  cd "C:\Users\Aman Juneja\Desktop\composio_task\dep-graph"
+  npm install --legacy-peer-deps        # matches generator.json's declared build step
+  node --import tsx src/generate.ts github_catalog.json   # matches generator.json's run step
+  npm run selfcheck                     # convenience wrapper that also prints metrics
+  npm run visualize                     # regenerate graph.html from the latest dependency_graph.json

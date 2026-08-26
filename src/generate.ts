@@ -326,13 +326,19 @@ function buildHeuristicEdges(tools: Tool[]): CandidateEdge[] {
 const LLM_MODEL = process.env.OPENAI_MODEL ?? "openai/gpt-4o";
 /** Cap how many candidate edges we'll spend tokens refining, keeps this bounded on huge catalogs. */
 const LLM_MAX_EDGES = Number(process.env.DEPGRAPH_LLM_MAX_EDGES ?? 2000);
-const LLM_BATCH_SIZE = 15;
+const LLM_BATCH_SIZE = 10;
 const LLM_CONCURRENCY = 5;
+/**
+ * The completion is a short JSON verdict list, not prose -- keep this small. Letting the SDK
+ * default max_tokens (which can be the model's full completion ceiling, e.g. 16384) burns
+ * credits fast on hundreds of batches and risks a mid-run 402 on a metered key.
+ */
+const LLM_MAX_TOKENS = 200;
 
 function toolSummary(tool: Tool | undefined): { slug: string; description: string } {
   const slug = tool ? String(slugOf(tool)) : "unknown";
   const description = tool?.description ?? tool?.name ?? "";
-  return { slug, description: String(description).slice(0, 240) };
+  return { slug, description: String(description).slice(0, 120) };
 }
 
 async function refineWithLLM(
@@ -360,6 +366,7 @@ async function refineWithLLM(
   }
 
   const kept: (CandidateEdge | null)[][] = new Array(batches.length);
+  let failedBatches = 0;
 
   async function runBatch(batchIdx: number) {
     const batch = batches[batchIdx];
@@ -393,13 +400,17 @@ async function refineWithLLM(
         model: LLM_MODEL,
         messages: [{ role: "user", content: prompt }],
         temperature: 0,
+        max_tokens: LLM_MAX_TOKENS,
       });
       const text = resp.choices[0]?.message?.content ?? "[]";
       const jsonText = text.slice(text.indexOf("["), text.lastIndexOf("]") + 1);
       const verdicts: { index: number; keep: boolean }[] = JSON.parse(jsonText);
       const verdictByIndex = new Map(verdicts.map((v) => [v.index, v.keep]));
+      const rejected = batch.filter((_, i) => verdictByIndex.get(i) === false).length;
       kept[batchIdx] = batch.map((e, i) => (verdictByIndex.get(i) !== false ? e : null));
+      console.error(`LLM refinement batch ${batchIdx}: kept ${batch.length - rejected}/${batch.length}`);
     } catch (err) {
+      failedBatches++;
       console.error(`LLM refinement batch ${batchIdx} failed (${(err as Error).message}); keeping candidates as-is.`);
       kept[batchIdx] = batch;
     }
@@ -415,6 +426,11 @@ async function refineWithLLM(
   await Promise.all(Array.from({ length: Math.min(LLM_CONCURRENCY, batches.length) }, worker));
 
   const refined = kept.flat().filter((e): e is CandidateEdge => e !== null);
+  const rejectedTotal = toRefine.length - refined.length;
+  console.error(
+    `LLM refinement summary: ${refined.length}/${toRefine.length} candidates kept ` +
+      `(${rejectedTotal} rejected), ${failedBatches}/${batches.length} batches fell back to keep-as-is.`,
+  );
   return [...refined, ...overflow];
 }
 
