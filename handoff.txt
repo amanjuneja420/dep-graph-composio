@@ -18,9 +18,12 @@ Commits so far:
 
 The deliverable (generator at src/generate.ts) is FUNCTIONALLY COMPLETE and passes the
 grader's gates:
-  - `npm run selfcheck` -> 893 nodes, 3539 edges, provenance_ratio 1.0, labeled_edges 3539
-    (this number moved twice during this session as real bugs got fixed post-advisor-review;
-    see IMPORTANT REWRITE and the commit trail if a stale number shows up somewhere)
+  - `npm run selfcheck` -> 893 nodes, 2909 edges, provenance_ratio 1.0, labeled_edges 2909
+    (this number moved three times during this session as real bugs got fixed across
+    successive advisor reviews; see IMPORTANT REWRITE and the commit trail if a stale number
+    shows up somewhere — 8515 uncapped -> 2528 hardcoded-alias version -> 2654 catalog-derived
+    but with wrapper-title bug -> 3539 with wrapper-title fixed but ambient-context noise ->
+    2909 final, with owner/repo/org filtered as ambient caller-supplied context)
   - Both README example chains verified present and correct:
       GITHUB_LIST_REPOSITORY_ISSUES -> GITHUB_CREATE_AN_ISSUE_COMMENT   (label: issue_number)
       GITHUB_LIST_PULL_REQUESTS     -> GITHUB_MERGE_A_PULL_REQUEST      (label: pull_number)

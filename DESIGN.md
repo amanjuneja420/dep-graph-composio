@@ -81,6 +81,26 @@ slug-inferred one. Qualified (`entity_leaf`) registration is unaffected and stil
 slug-inferred fallback for root-level fields, since that's a deliberate, weaker-but-labeled
 inference rather than an accidental one.
 
+## Filtering out ambient caller-supplied context
+
+Even after the above fix, `repo`/`owner`/`org` still dominated the label histogram (821/3539
+edges, ~23%) — each fanning out from one degenerate producer (an audit-log tool whose response
+happens to nest a `repo` field) to hundreds of unrelated consumers. The README itself draws
+this exact distinction: a dependency graph exists to tell you "either what info to get from
+the user, **or** what other action to take first" — `owner`/`repo`/`org` are the canonical
+*get-from-the-user* case (required by ~50%, ~49%, and ~21% of the entire catalog respectively),
+not something you'd realistically call another tool to look up.
+
+The fix uses the same principle as everything else here — derive it from the catalog, don't
+hardcode the three field names: count how many tools *require* each field name catalog-wide,
+and skip matching a field entirely (both bare and qualified) when it's required by both a large
+absolute count (>30) **and** a large share (>15%) of all tools (`isAmbientContext`). The dual
+threshold matters: on the 7-tool fake fixture, `ticket_number` is required by 4/7 tools (57%)
+but only 4 in absolute terms, so it's untouched — a fraction-only threshold would have silently
+gutted the fixture's best edges. Result: 3539 → 2909 edges on GitHub, `owner`/`repo`/`org`
+edges gone entirely, `username` (8.6% — under the fraction threshold) still present since it's
+a much weaker ambient signal, fixture unaffected (still 10/10).
+
 ## The LLM refinement pass (implemented, not live-verified)
 
 `refineWithLLM` batches the heuristic candidates and asks the model to confirm/reject each one

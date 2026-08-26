@@ -292,6 +292,21 @@ function producerRank(slug: string): number {
 /** Cap on how many producer tools we keep per (consumer tool, required field). */
 const MAX_PRODUCERS_PER_FIELD = 6;
 
+/**
+ * A required field that's ambient caller-supplied context (the README's own distinction:
+ * "either what info to get from the user OR what other action we should take before we
+ * execute" -- fields like GitHub's `owner`/`repo`/`org` are squarely the former, required by
+ * roughly half the entire catalog) rather than something you'd realistically look up via
+ * another tool call first. Gated on BOTH a fraction and an absolute count so it can't fire on
+ * a small catalog where a field is required by a large *share* of a handful of tools without
+ * actually being ubiquitous (e.g. a 7-tool fixture where one field is required by 4 tools).
+ */
+const AMBIENT_FRACTION_THRESHOLD = 0.15;
+const AMBIENT_MIN_COUNT = 30;
+function isAmbientContext(field: string, requiredByCount: number, totalTools: number): boolean {
+  return requiredByCount > AMBIENT_MIN_COUNT && requiredByCount / totalTools > AMBIENT_FRACTION_THRESHOLD;
+}
+
 /** Producer index entry: a tool slug, and the entity it produces this leaf under (undefined
  *  when the leaf is only registered as a bare/distinctive candidate with no entity tag). */
 type ProducerEntry = { producerSlug: string; entity: string | undefined };
@@ -332,11 +347,21 @@ function buildHeuristicEdges(tools: Tool[], vocab: CatalogVocabulary): Candidate
     edges.push({ from: producerSlug, to: consumerSlug, label: field });
   }
 
+  // How many tools require each field, catalog-wide -- used to filter out ambient context.
+  const fieldRequiredByCount = new Map<string, number>();
+  for (const tool of tools) {
+    for (const rawField of extractRequiredInputs(tool)) {
+      const field = toSnake(rawField);
+      fieldRequiredByCount.set(field, (fieldRequiredByCount.get(field) ?? 0) + 1);
+    }
+  }
+
   for (const tool of tools) {
     const consumerSlug = slugOf(tool);
     if (!consumerSlug) continue;
     for (const rawField of extractRequiredInputs(tool)) {
       const field = toSnake(rawField);
+      if (isAmbientContext(field, fieldRequiredByCount.get(field) ?? 0, tools.length)) continue;
       const matched = new Map<string, ProducerEntry>(); // producerSlug -> entry (dedupe)
 
       // bare/distinctive match: the whole field name equals a distinctively-scoped leaf key
