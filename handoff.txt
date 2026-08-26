@@ -12,46 +12,71 @@ Commits so far:
   2e6f2dc Assessment: initial state          (given)
   d869b28 Implement heuristic dependency inference in generate()
   63c2011 Add self-contained graph visualization
-  (+ this session will add one more: final hardening + this handoff file)
+  24465be Harden LLM refinement token budget; ship heuristic-only graph; add handoff notes
+  (+ one more: rewrote entity/leaf matching to be fully catalog-derived, no GitHub-specific
+    vocabulary — see IMPORTANT REWRITE below — plus DESIGN.md)
 
 The deliverable (generator at src/generate.ts) is FUNCTIONALLY COMPLETE and passes the
 grader's gates:
-  - `npm run selfcheck` -> 893 nodes, 2528 edges, provenance_ratio 1.0, labeled_edges 2528
+  - `npm run selfcheck` -> 893 nodes, 2654 edges, provenance_ratio 1.0, labeled_edges 2654
   - Both README example chains verified present and correct:
       GITHUB_LIST_REPOSITORY_ISSUES -> GITHUB_CREATE_AN_ISSUE_COMMENT   (label: issue_number)
       GITHUB_LIST_PULL_REQUESTS     -> GITHUB_MERGE_A_PULL_REQUEST      (label: pull_number)
   - graph.html (committed, self-contained, embedded data) renders and is interactive
     (drag/zoom/search/click-to-highlight) — verified in a real browser this session.
 
+IMPORTANT REWRITE — generalization fix (read this if continuing)
+--------------------------------------------------------------------
+An earlier version of this session hardcoded a GitHub-specific `ENTITY_ALIASES` dictionary
+(issue, pull_request, repository, ...). An advisor review caught that this directly violates
+the README's stated requirement ("your generator should generalize... works for any toolkit,
+not just this one") — on a non-GitHub catalog, `entitiesFromSlug` would return `[]` for nearly
+every tool and the whole qualified-matching pathway would collapse to ~0 edges, failing the
+has-edges gate on exactly the property the grader said they'd check.
+
+Fixed by making entity/leaf vocabulary 100% catalog-derived (see DESIGN.md for full
+rationale): `buildVocabulary()` walks the WHOLE catalog first to discover entity names (from
+$ref titles) and which leaf field names are "distinctive" (appear under ≤2 distinct entities
+catalog-wide) vs. generic. Matching then uses fuzzy token/substring comparison
+(`entityMatchesWord`) instead of a fixed dictionary. Proven against a committed fake,
+zero-GitHub-vocabulary catalog: `fixtures/fake_toolkit_catalog.json` (a made-up "Linear"
+ticket-tracker toolkit) — run
+  node --import tsx src/generate.ts fixtures/fake_toolkit_catalog.json
+and it correctly produces 10 edges (e.g. LINEAR_LIST_PROJECTS -> LINEAR_LIST_TICKETS via
+project_id) from a schema shape the code has never seen. This fixture is the actual evidence
+for the generalization claim — don't delete it.
+
 HOW THE GENERATOR WORKS (src/generate.ts)
 -------------------------------------------
-Two-pass design:
+Full rationale in DESIGN.md. Summary:
 
-1. Heuristic schema matching (deterministic, no network, this is what's actually shipped
-   right now since the LLM pass never got verified live — see "OPEN ISSUE" below):
-   - `extractProducibleFields(tool)` walks a tool's outputParameters (resolving $ref/$defs,
-     including array-item entities like `Issue`/`PullRequest` and one/two levels of nested
-     objects) and registers "qualified" candidate fields, e.g. an `Issue` object's bare
-     `number` property becomes the candidate `issue_number` (because it's inside an
-     Issue-typed context). Generic leaf names (id/number/name/key/node_id/slug) MUST be
-     qualified by an entity to be registered; distinctive leaf names (sha/ref/login/email/
-     tag_name/branch) are registered both bare and qualified.
-   - For fields sitting directly on a tool's response root (e.g. GITHUB_GET_AN_ISSUE's
-     top-level `number`), the entity context comes from scanning the TOOL'S OWN SLUG for
-     known entity keywords (`entitiesFromSlug`), since the wrapper schema's own title
-     (e.g. "GetAnIssueResponse") isn't a reliable entity name.
-   - `ENTITY_ALIASES` maps canonical entities to the short forms Composio/GitHub actually use
-     in parameter names (pull_request -> pull/pr, repository -> repo, organization -> org,
-     etc.) so e.g. a producer's qualified `pull_request_number` also registers as
-     `pull_number`, matching consumers that require exactly `pull_number`.
-   - `extractRequiredInputs(tool)` just reads `inputParameters.required`.
-   - `buildHeuristicEdges` matches each tool's required fields against the producer index,
-     excludes self-loops, and CAPS producers per (consumer, field) at 6 — preferring
-     LIST/GET/SEARCH/FIND-verb tools first (more natural "precursor" actions) — because
-     without a cap, extremely common fields like `repository_id` were matching 1000+
-     producers and drowning the graph in low-value edges (first uncapped attempt: 8515
-     edges; capped: 2528, much more sane signal-to-noise).
-   - `inferService(slug)` reuses `entitiesFromSlug` for the optional Node.service field.
+1. Heuristic schema matching (deterministic, no network, catalog-derived, this is what's
+   actually shipped right now since the LLM pass never got verified live — see "OPEN ISSUE"
+   below):
+   - Pass 1, `buildVocabulary(tools)`: walk every tool's outputParameters catalog-wide
+     (resolving $ref/$defs, array items, nested objects via `walkOutputLeaves`) to collect
+     (a) the set of all entity names seen (from $ref titles, e.g. `issue`, `pull_request` —
+     or, on a different toolkit, whatever nouns it uses) and (b) which leaf field names are
+     "distinctive" (appear under <=2 distinct entities catalog-wide, e.g. `tag_name`, `sha`)
+     vs. generic (appear under many, e.g. `id`, `name`, `number`) — NO fixed dictionary.
+   - Pass 2, `buildHeuristicEdges(tools, vocab)`: for each tool's required input field, try a
+     bare match against a distinctive leaf key, or split at the last underscore and fuzzily
+     match the prefix against a vocab entity (`entityMatchesWord`: token match or substring —
+     `repo` vs `repository`, `pull` vs `pull_request` — derived from the catalog's OWN entity
+     names, not a hardcoded alias table).
+   - `entitiesFromSlug(slug, vocab)` figures out which catalog entities a tool's own slug
+     refers to (for fields sitting directly on a response root, e.g. GITHUB_GET_AN_ISSUE's
+     top-level `number`) by fuzzy token match against the pass-1 vocabulary — again, no fixed
+     keyword list.
+   - CAPS producers per (consumer, field) at 6 — preferring list/get/search/find/query-verb
+     tools first (more natural "precursor" actions) — because without a cap, extremely common
+     fields like `repository_id` were matching 1000+ producers and drowning the graph in
+     low-value edges (first uncapped attempt: 8515 edges; capped: ~2650, much better
+     signal-to-noise).
+   - `inferService(slug, vocab)` reuses `entitiesFromSlug` for the optional Node.service field.
+   - PROVEN to generalize (not just claimed): `fixtures/fake_toolkit_catalog.json` is a
+     committed 7-tool fake "Linear" catalog with zero GitHub vocabulary; running the generator
+     against it produces 10 correct edges. See IMPORTANT REWRITE above.
 
 2. LLM refinement (`refineWithLLM`, OPTIONAL, gracefully degrades):
    - Only runs if `OPENAI_API_KEY` is set in env (also reads `OPENAI_BASE_URL`,
@@ -111,26 +136,29 @@ FILES
   src/generate.ts   — the generator (all real logic lives here)
   src/visualize.ts  — reads dependency_graph.json, writes self-contained graph.html
   src/selfcheck.ts  — READ-ONLY grader-provided harness, do not modify
+  DESIGN.md         — human-facing writeup of the approach and decisions (rubric asks for this)
   graph.html        — COMMITTED visualization snapshot (embeds the graph JSON directly,
                        since dependency_graph.json itself is gitignored as regenerated output)
   dependency_graph.json — gitignored, regenerated by `npm run generate -- github_catalog.json`
                        or `npm run selfcheck`; NOT meant to be committed (grader runs the
                        generator itself per generator.json)
   github_catalog.json — provided input, stays committed as-is
+  fixtures/fake_toolkit_catalog.json — committed fake non-GitHub catalog, proves the
+                       generator generalizes (see IMPORTANT REWRITE above); don't delete
   package.json      — scripts: generate, selfcheck, visualize
 
 REMAINING / OPTIONAL FURTHER WORK (not required to pass, but would deepen the submission)
 --------------------------------------------------------------------------------------------
   - Verify the LLM refinement pass live (see above) once credits are available, and
     re-commit the LLM-refined graph.html/summary if it demonstrably improves precision.
-  - Consider testing generate.ts against a second, different toolkit's catalog (not just
-    GitHub) to confirm it truly generalizes as the README requires ("your generator should
-    generalize... it works for any toolkit, not just this one") — no second catalog was
-    provided in this repo, so this would require sourcing one (e.g. another Composio
-    toolkit's tool list) — optional, not blocking.
+  - Test generate.ts against a second REAL toolkit's catalog (not the hand-written fake one)
+    for a stronger generalization proof than fixtures/fake_toolkit_catalog.json alone — none
+    was provided in this repo, so this would require sourcing one (e.g. another Composio
+    toolkit's tool list) — optional, not blocking, since the fake fixture already
+    demonstrates the mechanism is catalog-derived rather than GitHub-hardcoded.
   - Manually spot-check a larger random sample of edges (beyond the two README examples) for
-    precision, and consider whether MAX_PRODUCERS_PER_FIELD (currently 6) or the entity
-    alias table should be tuned further based on that review.
+    precision, and consider whether MAX_PRODUCERS_PER_FIELD (currently 6) or
+    DISTINCTIVE_ENTITY_THRESHOLD (currently 2) should be tuned based on that review.
 
 HOW TO RUN THE WHOLE THING FRESH
 -----------------------------------

@@ -14,15 +14,27 @@
  * which other tools' outputs could plausibly supply a value for it, and emit those as
  * producer -> consumer edges. This is done in two passes:
  *
- *   1. Heuristic schema matching (deterministic, catalog-only, no network calls). We walk
- *      each tool's outputParameters (resolving $ref/$defs) to collect "qualified" producible
- *      fields -- e.g. a `LIST_REPOSITORY_ISSUES` tool returns an array of `Issue` objects
- *      that each have a bare `number` field; we register that as the qualified candidate
- *      `issue_number`, `issue_id`, etc. We do the same to figure out which entity a tool's
- *      *required* input field belongs to (from the tool's own slug), then look up a match.
- *      This mirrors how the GitHub API itself names things (`issue_number`, `pull_number`,
- *      `owner`, `repo`, ...) so exact/aliased qualified-name matching catches the vast
- *      majority of real dependencies without ever calling a model.
+ *   1. Heuristic schema matching (deterministic, catalog-only, no network calls, and NOT
+ *      GitHub-specific -- every entity/leaf name it matches against is discovered from
+ *      whatever catalog it's handed, in two structural passes:
+ *        a) scan every tool's outputParameters to build a vocabulary of "entities" (the
+ *           $ref-titled object types that show up as array items or nested properties, e.g.
+ *           `Issue`, `PullRequest` -- or, for a different toolkit, whatever nouns that
+ *           toolkit's schemas use) and, for every leaf (scalar) field name, how many distinct
+ *           entities it appears under catalog-wide (a field appearing under many entities,
+ *           like `id`/`name`, is "generic"; one appearing under only one or two, like
+ *           `tag_name`, is "distinctive").
+ *        b) for each tool's required input fields, match against that vocabulary two ways:
+ *           an exact/bare match against a distinctive leaf key (covers fields like `sha`,
+ *           `ref`, `tag_name` that need no qualifier), or a `<entity>_<leaf>` split match
+ *           where the prefix fuzzily names an entity (covers `issue_number`, `pull_number`,
+ *           `repo` vs. `repository`, etc. -- via token/substring matching, not a fixed
+ *           dictionary of English nouns).
+ *      This is how the GitHub catalog's own naming (`issue_number`, `pull_number`, `owner`,
+ *      `repo`, ...) gets matched, but the mechanism itself carries no GitHub-specific
+ *      vocabulary -- point it at a different toolkit's catalog and it rebuilds the entity/leaf
+ *      vocabulary from that catalog instead. See DESIGN.md for the full rationale and a
+ *      worked example against a second, non-GitHub fake catalog.
  *
  *   2. LLM refinement (optional, only runs if OPENAI_API_KEY is set). The heuristic pass is
  *      good at recall but can't tell "this field merely has the same name" from "this field
@@ -84,74 +96,34 @@ function toSnake(s: string): string {
 }
 
 /**
- * Known GitHub-domain entities and the short forms Composio's own slugs/params use for them
- * (e.g. `pull_number` instead of `pull_request_number`, `repo` instead of `repository`).
- * Every alias maps to the same canonical entity, and when we register a qualified field we
- * register it once per alias so matching works from either direction.
+ * Fold simple English plurals so token comparisons treat "issues"/"issue",
+ * "requests"/"request" as the same word. A small, explicitly acknowledged non-generalization
+ * (see DESIGN.md) -- the rest of the entity/leaf vocabulary below is 100% catalog-derived.
  */
-const ENTITY_ALIASES: Record<string, string[]> = {
-  issue: ["issue"],
-  pull_request: ["pull_request", "pull", "pr"],
-  repository: ["repository", "repo"],
-  organization: ["organization", "org"],
-  comment: ["comment"],
-  label: ["label"],
-  milestone: ["milestone"],
-  branch: ["branch"],
-  release: ["release"],
-  tag: ["tag"],
-  commit: ["commit"],
-  gist: ["gist"],
-  review: ["review"],
-  workflow_run: ["workflow_run", "run"],
-  workflow: ["workflow"],
-  job: ["job"],
-  artifact: ["artifact"],
-  webhook: ["webhook", "hook"],
-  deployment: ["deployment"],
-  environment: ["environment"],
-  project: ["project"],
-  team: ["team"],
-  user: ["user"],
-  discussion: ["discussion"],
-  check_run: ["check_run", "check"],
-  invitation: ["invitation"],
-  installation: ["installation"],
-  app: ["app"],
-  key: ["key"],
-  collaborator: ["collaborator"],
-  event: ["event"],
-  file: ["file"],
-  reference: ["reference", "ref"],
-  secret: ["secret"],
-  variable: ["variable"],
-  migration: ["migration"],
-  package: ["package"],
-  asset: ["asset"],
-};
-
-// alias word -> canonical entity, longest-alias-first for greedy slug scanning
-const ALIAS_TO_CANONICAL = new Map<string, string>();
-for (const [canonical, aliases] of Object.entries(ENTITY_ALIASES)) {
-  for (const alias of aliases) ALIAS_TO_CANONICAL.set(alias, canonical);
+function singularize(word: string): string {
+  if (word.length > 3 && word.endsWith("ies")) return word.slice(0, -3) + "y";
+  if (word.length > 3 && word.endsWith("s") && !word.endsWith("ss")) return word.slice(0, -1);
+  return word;
 }
-const ALL_ALIASES_BY_LENGTH = [...ALIAS_TO_CANONICAL.keys()].sort((a, b) => b.length - a.length);
+function tokens(s: string): string[] {
+  return toSnake(s)
+    .split("_")
+    .filter(Boolean)
+    .map(singularize);
+}
 
-/** Leaf field names generic enough that they need an entity qualifier to be a useful label. */
-const GENERIC_LEAFS = new Set(["id", "number", "name", "key", "node_id", "slug"]);
-/** Leaf field names distinctive enough to also be registered unqualified. */
-const DISTINCTIVE_LEAFS = new Set(["sha", "ref", "login", "email", "tag_name", "branch"]);
-const CANDIDATE_LEAFS = new Set([...GENERIC_LEAFS, ...DISTINCTIVE_LEAFS]);
-
-/** Which entity keywords are present in a tool's own slug (used to qualify its own bare output fields). */
-function entitiesFromSlug(slug: string): string[] {
-  const words = new Set(toSnake(slug).split("_"));
-  const found = new Set<string>();
-  for (const alias of ALL_ALIASES_BY_LENGTH) {
-    const aliasWords = alias.split("_");
-    if (aliasWords.every((w) => words.has(w))) found.add(ALIAS_TO_CANONICAL.get(alias)!);
-  }
-  return [...found];
+/**
+ * Does `entity` (a canonical entity name like "pull_request") plausibly correspond to a
+ * short-form `word` used elsewhere (like "pull", "pr" is NOT caught -- true acronyms aren't
+ * derivable from token/substring matching, only truncations/single-token references are)?
+ * Matches by exact token membership ("pull" is a token of "pull_request") or by the entity's
+ * token-joined form starting with the word ("repo" is a prefix of "repository").
+ */
+function entityMatchesWord(entity: string, word: string): boolean {
+  const entityTokens = tokens(entity);
+  if (entityTokens.includes(word)) return true;
+  const joined = entityTokens.join("");
+  return word.length >= 3 && joined.startsWith(word);
 }
 
 // ---------------------------------------------------------------------------
@@ -167,67 +139,44 @@ function resolveRef(schema: JSONSchema, defs: Record<string, JSONSchema>): JSONS
   return schema;
 }
 
-/** A candidate producible field: qualified label -> (unused metadata for now, just presence). */
-type ProducerField = { label: string; leaf: string };
+/** One occurrence of a leaf (scalar) field found while walking a tool's output schema. */
+type LeafOccurrence = { leaf: string; entity: string | undefined };
 
 /**
- * Walk a tool's outputParameters and collect every candidate producible field, qualified by
- * the entity it logically belongs to (from the surrounding object's title, the property key
- * that led to it, or -- for fields sitting directly on the response root -- the tool's own
- * slug, e.g. GITHUB_GET_AN_ISSUE's bare `number` field becomes `issue_number`).
+ * Walk a tool's outputParameters and collect every scalar leaf field it produces, tagged with
+ * the entity it belongs to when we can tell (from the nearest enclosing $ref's own title --
+ * never from the property key, so this needs no fixed vocabulary at all). Fields sitting
+ * directly on the tool's own response root (depth 0, e.g. a `GET_AN_ISSUE`-style endpoint
+ * that returns the entity inline rather than nested) have no title-derived entity; the caller
+ * fills that in from the tool's slug once the catalog-wide entity vocabulary is known.
  */
-function extractProducibleFields(tool: Tool): ProducerField[] {
-  const out: ProducerField[] = tool.outputParameters;
+function walkOutputLeaves(tool: Tool): LeafOccurrence[] {
+  const out: JSONSchema = tool.outputParameters;
   if (!out || typeof out !== "object") return [];
   const defs: Record<string, JSONSchema> = out.$defs ?? {};
-  const rootEntities = entitiesFromSlug(String(slugOf(tool) ?? ""));
-  const results: ProducerField[] = [];
+  const results: LeafOccurrence[] = [];
   const seenPaths = new Set<string>();
 
-  function registerLeaf(entityCanonical: string | undefined, leaf: string) {
-    const entities = entityCanonical ? [entityCanonical] : rootEntities;
-    if (GENERIC_LEAFS.has(leaf)) {
-      for (const canonical of entities) {
-        for (const alias of ENTITY_ALIASES[canonical] ?? [canonical]) {
-          results.push({ label: `${alias}_${leaf}`, leaf });
-        }
-      }
-    }
-    if (DISTINCTIVE_LEAFS.has(leaf)) {
-      results.push({ label: leaf, leaf });
-      for (const canonical of entities) {
-        for (const alias of ENTITY_ALIASES[canonical] ?? [canonical]) {
-          results.push({ label: `${alias}_${leaf}`, leaf });
-        }
-      }
-    }
-  }
-
   function walk(node: JSONSchema, entityCtx: string | undefined, depth: number, path: string) {
-    if (!node || depth > 3 || seenPaths.has(path)) return;
+    if (!node || depth > 4 || seenPaths.has(path)) return;
     seenPaths.add(path);
     const resolved = resolveRef(node, defs);
-    const entityFromTitle =
-      entityCtx ?? (resolved.title ? ALIAS_TO_CANONICAL.get(toSnake(resolved.title)) : undefined);
+    const entityFromTitle = depth > 0 && resolved.title ? toSnake(resolved.title) : entityCtx;
 
     if (resolved.type === "array" && resolved.items) {
       const itemsResolved = resolveRef(resolved.items, defs);
-      const itemEntity =
-        entityFromTitle ??
-        (itemsResolved.title ? ALIAS_TO_CANONICAL.get(toSnake(itemsResolved.title)) : undefined);
+      const itemEntity = itemsResolved.title ? toSnake(itemsResolved.title) : entityFromTitle;
       walk(itemsResolved, itemEntity, depth + 1, path + "[]");
       return;
     }
     if (resolved.properties && typeof resolved.properties === "object") {
       for (const [key, prop] of Object.entries<JSONSchema>(resolved.properties)) {
         const propPath = `${path}.${key}`;
-        const propKeyEntity = ALIAS_TO_CANONICAL.get(key) ?? entityFromTitle;
-        if (CANDIDATE_LEAFS.has(key)) {
-          registerLeaf(propKeyEntity, key);
-        }
-        if (prop && typeof prop === "object" && (prop.$ref || prop.type === "array" || prop.properties)) {
-          const nextEntity = ALIAS_TO_CANONICAL.get(key) ?? undefined;
-          walk(prop, nextEntity, depth + 1, propPath);
+        const isContainer = prop && typeof prop === "object" && (prop.$ref || prop.type === "array" || prop.properties);
+        if (isContainer) {
+          walk(prop, undefined, depth + 1, propPath);
+        } else if (prop && typeof prop === "object" && prop.type && prop.type !== "object") {
+          results.push({ leaf: toSnake(key), entity: entityFromTitle });
         }
       }
     }
@@ -246,16 +195,64 @@ function extractRequiredInputs(tool: Tool): string[] {
 }
 
 // ---------------------------------------------------------------------------
-// service inference (best-effort, for the optional Node.service field)
+// catalog-wide vocabulary (pass 1): entities + leaf distinctiveness, both derived
+// purely from the catalog we were handed -- no fixed toolkit-specific dictionary.
 // ---------------------------------------------------------------------------
 
-function inferService(slug: string): string | undefined {
-  const entities = entitiesFromSlug(slug);
-  return entities[0];
+/** A leaf appearing under this many or fewer distinct entities catalog-wide is "distinctive"
+ *  enough to also match bare/unqualified (e.g. `sha`, `tag_name`); above it, it needs an
+ *  entity qualifier (e.g. bare `id`/`name`/`number` are hopelessly ambiguous catalog-wide). */
+const DISTINCTIVE_ENTITY_THRESHOLD = 2;
+
+interface CatalogVocabulary {
+  entities: Set<string>;
+  distinctiveLeaves: Set<string>;
+}
+
+function buildVocabulary(tools: Tool[]): CatalogVocabulary {
+  const entities = new Set<string>();
+  const leafEntities = new Map<string, Set<string>>();
+
+  for (const tool of tools) {
+    for (const { leaf, entity } of walkOutputLeaves(tool)) {
+      if (entity) {
+        entities.add(entity);
+        if (!leafEntities.has(leaf)) leafEntities.set(leaf, new Set());
+        leafEntities.get(leaf)!.add(entity);
+      }
+    }
+  }
+
+  const distinctiveLeaves = new Set<string>();
+  for (const [leaf, ents] of leafEntities) {
+    if (ents.size <= DISTINCTIVE_ENTITY_THRESHOLD) distinctiveLeaves.add(leaf);
+  }
+  return { entities, distinctiveLeaves };
+}
+
+/** Which catalog entities a tool's own slug plausibly refers to (fuzzy token match, no
+ *  fixed dictionary -- e.g. slug tokens ["get","an","issue"] match entity "issue"). */
+function entitiesFromSlug(slug: string, vocab: CatalogVocabulary): string[] {
+  const slugTokens = new Set(tokens(slug));
+  const found: string[] = [];
+  for (const entity of vocab.entities) {
+    const entityTokens = tokens(entity);
+    if (entityTokens.every((t) => slugTokens.has(t))) found.push(entity);
+  }
+  // prefer more specific (more-token) entity names first
+  return found.sort((a, b) => tokens(b).length - tokens(a).length);
 }
 
 // ---------------------------------------------------------------------------
-// heuristic candidate-edge generation
+// service inference (best-effort, for the optional Node.service field)
+// ---------------------------------------------------------------------------
+
+function inferService(slug: string, vocab: CatalogVocabulary): string | undefined {
+  return entitiesFromSlug(slug, vocab)[0];
+}
+
+// ---------------------------------------------------------------------------
+// heuristic candidate-edge generation (pass 2)
 // ---------------------------------------------------------------------------
 
 interface CandidateEdge extends Edge {
@@ -269,50 +266,78 @@ interface CandidateEdge extends Edge {
  * call to look up/discover a value) vs. a mutation. Read-style tools are ranked first when we
  * cap how many candidate producers we keep per (consumer, field) pair -- with hundreds of
  * tools sharing common fields like `repository_id`, keeping every possible producer would
- * bury the useful edges in noise.
+ * bury the useful edges in noise. Generic verb words, not toolkit-specific.
  */
-const READ_VERBS = ["LIST", "GET", "SEARCH", "FIND"];
+const READ_VERBS = new Set(["list", "get", "search", "find", "query"]);
 function producerRank(slug: string): number {
-  return READ_VERBS.some((v) => slug.startsWith(`GITHUB_${v}_`) || slug.includes(`_${v}_`)) ? 0 : 1;
+  return tokens(slug).some((t) => READ_VERBS.has(t)) ? 0 : 1;
 }
 
 /** Cap on how many producer tools we keep per (consumer tool, required field). */
 const MAX_PRODUCERS_PER_FIELD = 6;
 
-function buildHeuristicEdges(tools: Tool[]): CandidateEdge[] {
-  const producerIndex = new Map<string, Set<string>>(); // qualified label -> producer slugs
-  const toolBySlug = new Map<string, Tool>();
+/** Producer index entry: a tool slug, and the entity it produces this leaf under (undefined
+ *  when the leaf is only registered as a bare/distinctive candidate with no entity tag). */
+type ProducerEntry = { producerSlug: string; entity: string | undefined };
+
+function buildHeuristicEdges(tools: Tool[], vocab: CatalogVocabulary): CandidateEdge[] {
+  const producerIndex = new Map<string, ProducerEntry[]>(); // raw leaf key -> producers
+
+  function register(leaf: string, entity: string | undefined, producerSlug: string) {
+    if (!producerIndex.has(leaf)) producerIndex.set(leaf, []);
+    producerIndex.get(leaf)!.push({ producerSlug, entity });
+  }
 
   for (const tool of tools) {
     const slug = slugOf(tool);
     if (!slug) continue;
-    toolBySlug.set(slug, tool);
-    for (const field of extractProducibleFields(tool)) {
-      if (!producerIndex.has(field.label)) producerIndex.set(field.label, new Set());
-      producerIndex.get(field.label)!.add(slug);
+    const rootEntities = entitiesFromSlug(slug, vocab);
+    for (const { leaf, entity } of walkOutputLeaves(tool)) {
+      const resolvedEntities = entity ? [entity] : rootEntities;
+      if (resolvedEntities.length === 0 && !vocab.distinctiveLeaves.has(leaf)) continue;
+      for (const e of resolvedEntities) register(leaf, e, slug);
+      if (vocab.distinctiveLeaves.has(leaf)) register(leaf, undefined, slug);
     }
   }
 
   const edgeKeys = new Set<string>();
   const edges: CandidateEdge[] = [];
 
+  function addEdge(producerSlug: string, consumerSlug: string, field: string) {
+    if (producerSlug === consumerSlug) return;
+    const key = `${producerSlug}=>${consumerSlug}=>${field}`;
+    if (edgeKeys.has(key)) return;
+    edgeKeys.add(key);
+    edges.push({ from: producerSlug, to: consumerSlug, label: field });
+  }
+
   for (const tool of tools) {
     const consumerSlug = slugOf(tool);
     if (!consumerSlug) continue;
     for (const rawField of extractRequiredInputs(tool)) {
       const field = toSnake(rawField);
-      const producers = producerIndex.get(field);
-      if (!producers) continue;
-      const ranked = [...producers]
+      const matched = new Map<string, ProducerEntry>(); // producerSlug -> entry (dedupe)
+
+      // bare/distinctive match: the whole field name equals a distinctively-scoped leaf key
+      for (const entry of producerIndex.get(field) ?? []) {
+        if (entry.entity === undefined) matched.set(entry.producerSlug, entry);
+      }
+      // qualified match: split at the last underscore, prefix must fuzzily name an entity
+      // that produced the remaining leaf token
+      const fieldTokens = field.split("_");
+      if (fieldTokens.length >= 2) {
+        const leafKey = fieldTokens[fieldTokens.length - 1];
+        const prefix = fieldTokens.slice(0, -1).join("_");
+        for (const entry of producerIndex.get(leafKey) ?? []) {
+          if (entry.entity && entityMatchesWord(entry.entity, prefix)) matched.set(entry.producerSlug, entry);
+        }
+      }
+
+      const ranked = [...matched.keys()]
         .filter((p) => p !== consumerSlug)
         .sort((a, b) => producerRank(a) - producerRank(b) || a.localeCompare(b))
         .slice(0, MAX_PRODUCERS_PER_FIELD);
-      for (const producerSlug of ranked) {
-        const key = `${producerSlug}=>${consumerSlug}=>${field}`;
-        if (edgeKeys.has(key)) continue;
-        edgeKeys.add(key);
-        edges.push({ from: producerSlug, to: consumerSlug, label: field });
-      }
+      for (const producerSlug of ranked) addEdge(producerSlug, consumerSlug, field);
     }
   }
 
@@ -440,16 +465,18 @@ async function refineWithLLM(
 
 async function generate(tools: Tool[]): Promise<Graph> {
   const toolBySlug = new Map<string, Tool>();
-  const nodes: Node[] = tools
-    .map((t) => {
-      const slug = slugOf(t);
-      if (slug) toolBySlug.set(slug, t);
-      return slug;
-    })
-    .filter((s): s is string => !!s)
-    .map((id) => ({ id, service: inferService(id) }));
+  for (const t of tools) {
+    const slug = slugOf(t);
+    if (slug) toolBySlug.set(slug, t);
+  }
 
-  const heuristicEdges = buildHeuristicEdges(tools);
+  // Pass 1: derive the entity/leaf vocabulary from this catalog alone.
+  const vocab = buildVocabulary(tools);
+
+  const nodes: Node[] = [...toolBySlug.keys()].map((id) => ({ id, service: inferService(id, vocab) }));
+
+  // Pass 2: match required inputs against the vocabulary to produce candidate edges.
+  const heuristicEdges = buildHeuristicEdges(tools, vocab);
   const edges = await refineWithLLM(heuristicEdges, toolBySlug);
 
   return { nodes, edges };

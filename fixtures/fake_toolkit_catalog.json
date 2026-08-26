@@ -1,0 +1,246 @@
+[
+  {
+    "slug": "LINEAR_LIST_TICKETS",
+    "name": "List Tickets",
+    "description": "List tickets in a Linear project.",
+    "inputParameters": {
+      "type": "object",
+      "properties": {
+        "projectId": { "type": "string", "title": "Project Id" }
+      },
+      "required": ["projectId"]
+    },
+    "outputParameters": {
+      "type": "object",
+      "properties": {
+        "data": { "$ref": "#/$defs/ListTicketsResponse" },
+        "successful": { "type": "boolean" }
+      },
+      "required": ["data", "successful"],
+      "$defs": {
+        "Ticket": {
+          "type": "object",
+          "title": "Ticket",
+          "properties": {
+            "id": { "type": "string", "title": "Id" },
+            "number": { "type": "integer", "title": "Number" },
+            "title": { "type": "string", "title": "Title" },
+            "assigneeId": { "type": "string", "title": "Assignee Id" }
+          },
+          "required": ["id", "number", "title"]
+        },
+        "ListTicketsResponse": {
+          "type": "object",
+          "title": "ListTicketsResponse",
+          "properties": {
+            "tickets": { "type": "array", "items": { "$ref": "#/$defs/Ticket" }, "title": "Tickets" }
+          },
+          "required": ["tickets"]
+        }
+      }
+    }
+  },
+  {
+    "slug": "LINEAR_GET_TICKET",
+    "name": "Get Ticket",
+    "description": "Get a single ticket by number.",
+    "inputParameters": {
+      "type": "object",
+      "properties": {
+        "ticketNumber": { "type": "integer", "title": "Ticket Number" }
+      },
+      "required": ["ticketNumber"]
+    },
+    "outputParameters": {
+      "type": "object",
+      "properties": {
+        "data": { "$ref": "#/$defs/GetTicketResponse" },
+        "successful": { "type": "boolean" }
+      },
+      "required": ["data", "successful"],
+      "$defs": {
+        "GetTicketResponse": {
+          "type": "object",
+          "title": "GetTicketResponse",
+          "properties": {
+            "id": { "type": "string", "title": "Id" },
+            "number": { "type": "integer", "title": "Number" },
+            "title": { "type": "string", "title": "Title" },
+            "state": { "type": "string", "title": "State" }
+          },
+          "required": ["id", "number", "title", "state"]
+        }
+      }
+    }
+  },
+  {
+    "slug": "LINEAR_CREATE_TICKET_COMMENT",
+    "name": "Create Ticket Comment",
+    "description": "Add a comment to a ticket. Needs the ticket's number.",
+    "inputParameters": {
+      "type": "object",
+      "properties": {
+        "ticketNumber": { "type": "integer", "title": "Ticket Number" },
+        "body": { "type": "string", "title": "Body" }
+      },
+      "required": ["ticketNumber", "body"]
+    },
+    "outputParameters": {
+      "type": "object",
+      "properties": {
+        "data": { "$ref": "#/$defs/CreateTicketCommentResponse" },
+        "successful": { "type": "boolean" }
+      },
+      "required": ["data", "successful"],
+      "$defs": {
+        "CreateTicketCommentResponse": {
+          "type": "object",
+          "title": "CreateTicketCommentResponse",
+          "properties": {
+            "id": { "type": "string", "title": "Id" }
+          },
+          "required": ["id"]
+        }
+      }
+    }
+  },
+  {
+    "slug": "LINEAR_CLOSE_TICKET",
+    "name": "Close Ticket",
+    "description": "Close a ticket by its number.",
+    "inputParameters": {
+      "type": "object",
+      "properties": {
+        "ticketNumber": { "type": "integer", "title": "Ticket Number" }
+      },
+      "required": ["ticketNumber"]
+    },
+    "outputParameters": {
+      "type": "object",
+      "properties": {
+        "data": { "$ref": "#/$defs/CloseTicketResponse" },
+        "successful": { "type": "boolean" }
+      },
+      "required": ["data", "successful"],
+      "$defs": {
+        "CloseTicketResponse": {
+          "type": "object",
+          "title": "CloseTicketResponse",
+          "properties": {
+            "id": { "type": "string", "title": "Id" },
+            "state": { "type": "string", "title": "State" }
+          },
+          "required": ["id", "state"]
+        }
+      }
+    }
+  },
+  {
+    "slug": "LINEAR_LIST_PROJECTS",
+    "name": "List Projects",
+    "description": "List projects in the workspace.",
+    "inputParameters": {
+      "type": "object",
+      "properties": {},
+      "required": []
+    },
+    "outputParameters": {
+      "type": "object",
+      "properties": {
+        "data": { "$ref": "#/$defs/ListProjectsResponse" },
+        "successful": { "type": "boolean" }
+      },
+      "required": ["data", "successful"],
+      "$defs": {
+        "Project": {
+          "type": "object",
+          "title": "Project",
+          "properties": {
+            "id": { "type": "string", "title": "Id" },
+            "name": { "type": "string", "title": "Name" },
+            "slug": { "type": "string", "title": "Slug" }
+          },
+          "required": ["id", "name"]
+        },
+        "ListProjectsResponse": {
+          "type": "object",
+          "title": "ListProjectsResponse",
+          "properties": {
+            "projects": { "type": "array", "items": { "$ref": "#/$defs/Project" }, "title": "Projects" }
+          },
+          "required": ["projects"]
+        }
+      }
+    }
+  },
+  {
+    "slug": "LINEAR_LIST_TEAM_MEMBERS",
+    "name": "List Team Members",
+    "description": "List members of a team, used to find someone to assign a ticket to.",
+    "inputParameters": {
+      "type": "object",
+      "properties": {
+        "teamId": { "type": "string", "title": "Team Id" }
+      },
+      "required": ["teamId"]
+    },
+    "outputParameters": {
+      "type": "object",
+      "properties": {
+        "data": { "$ref": "#/$defs/ListTeamMembersResponse" },
+        "successful": { "type": "boolean" }
+      },
+      "required": ["data", "successful"],
+      "$defs": {
+        "Assignee": {
+          "type": "object",
+          "title": "Assignee",
+          "properties": {
+            "id": { "type": "string", "title": "Id" },
+            "email": { "type": "string", "title": "Email" }
+          },
+          "required": ["id", "email"]
+        },
+        "ListTeamMembersResponse": {
+          "type": "object",
+          "title": "ListTeamMembersResponse",
+          "properties": {
+            "members": { "type": "array", "items": { "$ref": "#/$defs/Assignee" }, "title": "Members" }
+          },
+          "required": ["members"]
+        }
+      }
+    }
+  },
+  {
+    "slug": "LINEAR_ASSIGN_TICKET",
+    "name": "Assign Ticket",
+    "description": "Assign a ticket to a person.",
+    "inputParameters": {
+      "type": "object",
+      "properties": {
+        "ticketNumber": { "type": "integer", "title": "Ticket Number" },
+        "assigneeId": { "type": "string", "title": "Assignee Id" }
+      },
+      "required": ["ticketNumber", "assigneeId"]
+    },
+    "outputParameters": {
+      "type": "object",
+      "properties": {
+        "data": { "$ref": "#/$defs/AssignTicketResponse" },
+        "successful": { "type": "boolean" }
+      },
+      "required": ["data", "successful"],
+      "$defs": {
+        "AssignTicketResponse": {
+          "type": "object",
+          "title": "AssignTicketResponse",
+          "properties": {
+            "id": { "type": "string", "title": "Id" }
+          },
+          "required": ["id"]
+        }
+      }
+    }
+  }
+]
