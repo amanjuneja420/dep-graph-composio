@@ -1,8 +1,16 @@
 /**
  * Renders `dependency_graph.json` (produced by generate.ts) as a single self-contained
- * `graph.html` file: the graph data is embedded inline (no fetch, no CDN, works from a plain
- * double-click or `file://`), and a small force-directed layout draws nodes as circles
- * (colored/grouped by `service`) with directed, labeled edges between them.
+ * `graph.html` file: the graph data -- INCLUDING a precomputed force-directed layout -- is
+ * embedded inline (no fetch, no CDN, works from a plain double-click or `file://`).
+ *
+ * The layout is computed here, in Node, at generation time, not in the browser at page-load
+ * time. An earlier version ran the same force-directed iterations client-side, synchronously,
+ * before first paint -- ~80 iterations x ~800k pairwise checks for an 893-node graph, which
+ * blocks the main thread for long enough that the page visibly looks stuck loading. Doing the
+ * same math once here (Node has no UI to block, so the cost is invisible) and shipping only
+ * the final x/y coordinates means the browser has zero physics to run: it draws static SVG
+ * and the page is interactive instantly. Panning/zooming/searching/highlighting all still work
+ * -- there's just no per-frame simulation.
  *
  * Usage: node --import tsx src/visualize.ts [path/to/dependency_graph.json] [out.html]
  */
@@ -13,135 +21,158 @@ const OUT_PATH = process.argv[3] ?? "graph.html";
 
 const graph = JSON.parse(readFileSync(IN_PATH, "utf-8"));
 
+// ---------------------------------------------------------------------------
+// layout (computed here, in Node, once -- see file header)
+// ---------------------------------------------------------------------------
+type LaidOutNode = { id: string; service?: string; x: number; y: number; degree: number };
+
+function computeLayout(nodes: { id: string; service?: string }[], edges: { from: string; to: string }[]): LaidOutNode[] {
+  const N = nodes.length;
+  const idx = new Map(nodes.map((n, i) => [n.id, i]));
+  const edgeIdx = edges
+    .map((e) => [idx.get(e.from), idx.get(e.to)] as const)
+    .filter((p): p is [number, number] => p[0] !== undefined && p[1] !== undefined);
+
+  const degree = new Array(N).fill(0);
+  for (const [a, b] of edgeIdx) { degree[a]++; degree[b]++; }
+
+  const extent = 260 + Math.sqrt(N) * 26; // scales with node count so it isn't a tight ball
+  const x = new Array(N), y = new Array(N), vx = new Array(N).fill(0), vy = new Array(N).fill(0);
+  for (let i = 0; i < N; i++) {
+    const angle = (i / N) * Math.PI * 2 + Math.random() * 0.4;
+    const r = extent * (0.25 + 0.75 * Math.random());
+    x[i] = Math.cos(angle) * r;
+    y[i] = Math.sin(angle) * r;
+  }
+
+  const SPRING_LENGTH = 60;
+  const ITERATIONS = 260;
+  for (let iter = 0; iter < ITERATIONS; iter++) {
+    const cool = 1 - iter / ITERATIONS; // simulated annealing: big moves early, fine settling late
+    for (let i = 0; i < N; i++) {
+      let fx = 0, fy = 0;
+      for (let j = 0; j < N; j++) {
+        if (i === j) continue;
+        const dx = x[i] - x[j], dy = y[i] - y[j];
+        const d2 = dx * dx + dy * dy || 0.01;
+        if (d2 > 160000) continue; // 400-unit cutoff keeps this fast without sacrificing spread
+        const d = Math.sqrt(d2);
+        const f = 9000 / d2;
+        fx += (dx / d) * f; fy += (dy / d) * f;
+      }
+      vx[i] += fx * cool; vy[i] += fy * cool;
+    }
+    for (const [a, b] of edgeIdx) {
+      const dx = x[b] - x[a], dy = y[b] - y[a];
+      const d = Math.sqrt(dx * dx + dy * dy) || 0.01;
+      const f = (d - SPRING_LENGTH) * 0.02;
+      vx[a] += (dx / d) * f; vy[a] += (dy / d) * f;
+      vx[b] -= (dx / d) * f; vy[b] -= (dy / d) * f;
+    }
+    for (let i = 0; i < N; i++) {
+      vx[i] += -x[i] * 0.0008; vy[i] += -y[i] * 0.0008;
+      x[i] += vx[i] *= 0.8;
+      y[i] += vy[i] *= 0.8;
+    }
+  }
+
+  return nodes.map((n, i) => ({ id: n.id, service: n.service, x: Math.round(x[i]), y: Math.round(y[i]), degree: degree[i] }));
+}
+
+const laidOutNodes = computeLayout(graph.nodes, graph.edges);
+
+// ---------------------------------------------------------------------------
+// HTML (browser side does rendering + interaction only, no physics)
+// ---------------------------------------------------------------------------
 const html = `<!doctype html>
 <html>
 <head>
 <meta charset="utf-8" />
 <title>dependency graph</title>
 <style>
-  html, body { margin: 0; height: 100%; background: #0b0d12; color: #e6e6e6; font-family: ui-sans-serif, system-ui, sans-serif; overflow: hidden; }
-  #hud { position: fixed; top: 10px; left: 10px; z-index: 2; background: rgba(20,22,30,0.85); padding: 10px 14px; border-radius: 8px; font-size: 13px; line-height: 1.5; max-width: 320px; }
-  #hud b { color: #fff; }
-  #search { width: 100%; margin-top: 6px; padding: 4px 6px; border-radius: 4px; border: 1px solid #444; background: #1a1d26; color: #eee; box-sizing: border-box; }
-  svg { display: block; width: 100vw; height: 100vh; }
-  .edge { stroke: #4a5568; stroke-opacity: 0.45; fill: none; }
-  .edge.hi { stroke: #ffb347; stroke-opacity: 0.95; stroke-width: 2; }
-  .edge-label { fill: #8892a0; font-size: 8px; pointer-events: none; }
-  .node circle { stroke: #0b0d12; stroke-width: 1.5px; cursor: pointer; }
-  .node text { fill: #d5d9e0; font-size: 9px; pointer-events: none; }
-  .node.dim { opacity: 0.15; }
-  .edge.dim { opacity: 0.05; }
+  :root { color-scheme: dark; }
+  html, body { margin: 0; height: 100%; background: #0a0b0d; color: #e6e6e6; font-family: ui-sans-serif, system-ui, -apple-system, sans-serif; overflow: hidden; }
+  svg { display: block; width: 100vw; height: 100vh; cursor: grab; }
+  svg.dragging { cursor: grabbing; }
+  #hud { position: fixed; top: 12px; left: 12px; z-index: 2; background: rgba(18,20,24,0.88); backdrop-filter: blur(6px); padding: 12px 16px; border-radius: 10px; font-size: 13px; line-height: 1.55; max-width: 300px; border: 1px solid rgba(255,255,255,0.08); }
+  #hud b { color: #fff; font-size: 14px; }
+  #search { width: 100%; margin-top: 8px; padding: 6px 8px; border-radius: 6px; border: 1px solid #3a3f47; background: #16181c; color: #eee; box-sizing: border-box; font-size: 13px; }
+  #search:focus { outline: none; border-color: #6c8cff; }
+  .hint { margin-top: 8px; opacity: 0.55; font-size: 11px; line-height: 1.5; }
+  #legend { position: fixed; bottom: 12px; left: 12px; z-index: 2; background: rgba(18,20,24,0.88); border-radius: 10px; padding: 10px 14px; font-size: 11px; max-height: 40vh; overflow-y: auto; border: 1px solid rgba(255,255,255,0.08); }
+  #legend .row { display: flex; align-items: center; gap: 6px; margin: 3px 0; opacity: 0.85; }
+  #legend .dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+  .edge { stroke: #4a5568; stroke-opacity: 0.28; fill: none; stroke-width: 0.7; }
+  .edge.hi { stroke: #ffb347; stroke-opacity: 0.95; stroke-width: 1.6; }
+  .edge.dim { stroke-opacity: 0.03; }
+  .node circle { stroke: #0a0b0d; stroke-width: 1.2px; cursor: pointer; }
+  .node text { fill: #dfe3e8; font-size: 9px; pointer-events: none; opacity: 0; transition: opacity 0.1s; }
+  .node.hub text, .node:hover text, .node.hi text, .node.match text { opacity: 0.9; }
+  .node.hi text { fill: #fff; font-weight: 600; }
+  .node.dim circle { opacity: 0.15; }
+  .node.dim text { opacity: 0 !important; }
 </style>
 </head>
 <body>
 <div id="hud">
   <div><b>dependency graph</b></div>
-  <div id="stats"></div>
+  <div id="stats" style="opacity:0.7; margin-top:2px;"></div>
   <input id="search" placeholder="filter by tool id or service..." />
-  <div style="margin-top:6px; opacity:0.7">drag to pan &middot; scroll to zoom &middot; click a node to highlight its edges</div>
+  <div class="hint">drag to pan &middot; scroll to zoom &middot; click a node to highlight its edges &middot; labels appear on hover / for hub nodes / on search match</div>
 </div>
-<svg></svg>
+<div id="legend"></div>
+<svg><g id="viewport"></g></svg>
 <script>
-const graph = ${JSON.stringify(graph).replace(/<\/script/gi, "<\\/script")};
-const nodes = graph.nodes.map(n => ({ ...n }));
-const edges = graph.edges.map(e => ({ ...e }));
+const nodes = ${JSON.stringify(laidOutNodes)};
+const rawEdges = ${JSON.stringify(graph.edges)};
 const byId = new Map(nodes.map(n => [n.id, n]));
 
-document.getElementById('stats').textContent =
-  nodes.length + ' nodes, ' + edges.length + ' edges';
+document.getElementById('stats').textContent = nodes.length + ' nodes, ' + rawEdges.length + ' edges';
 
-// color by service (stable hash -> hue)
 function hash(s) { let h = 0; for (const c of s) h = (h * 31 + c.charCodeAt(0)) | 0; return Math.abs(h); }
 function colorFor(service) {
-  if (!service) return '#6b7280';
-  const hue = hash(service) % 360;
-  return 'hsl(' + hue + ', 55%, 58%)';
+  if (!service) return 'hsl(220, 8%, 55%)';
+  return 'hsl(' + (hash(service) % 360) + ', 60%, 62%)';
 }
 
-const svg = document.querySelector('svg');
+const services = [...new Set(nodes.map(n => n.service).filter(Boolean))];
+const topServices = services
+  .map(s => ({ s, n: nodes.filter(n => n.service === s).length }))
+  .sort((a, b) => b.n - a.n)
+  .slice(0, 18);
+document.getElementById('legend').innerHTML =
+  '<div style="opacity:0.6;margin-bottom:4px;">service (top ' + topServices.length + ')</div>' +
+  topServices.map(({ s, n }) => '<div class="row"><span class="dot" style="background:' + colorFor(s) + '"></span>' + s + ' (' + n + ')</div>').join('');
+
 const NS = 'http://www.w3.org/2000/svg';
-const width = window.innerWidth, height = window.innerHeight;
-const viewport = document.createElementNS(NS, 'g');
-svg.appendChild(viewport);
+const svg = document.querySelector('svg');
+const viewport = document.getElementById('viewport');
 
-// simple force-directed layout (no deps): repel all nodes, spring edges, center pull
-const N = nodes.length;
-for (const n of nodes) {
-  const angle = Math.random() * Math.PI * 2;
-  const r = 200 + Math.random() * Math.min(width, height) * 0.4;
-  n.x = width / 2 + Math.cos(angle) * r;
-  n.y = height / 2 + Math.sin(angle) * r;
-  n.vx = 0; n.vy = 0;
-}
-const idx = new Map(nodes.map((n, i) => [n.id, i]));
-const edgeIdx = edges.map(e => [idx.get(e.from), idx.get(e.to)]).filter(([a, b]) => a !== undefined && b !== undefined);
+const hubThreshold = [...nodes.map(n => n.degree)].sort((a, b) => b - a)[Math.min(14, nodes.length - 1)] ?? Infinity;
 
-const ITER = Math.min(220, Math.max(80, Math.floor(30000 / Math.max(N, 1))));
-for (let iter = 0; iter < ITER; iter++) {
-  const k = Math.sqrt((width * height) / Math.max(N, 1)) * 0.9;
-  // repulsion (grid-bucketed would be better; N~900 is fine brute-force for a handful of passes)
-  for (let i = 0; i < N; i++) {
-    let fx = 0, fy = 0;
-    for (let j = 0; j < N; j++) {
-      if (i === j) continue;
-      let dx = nodes[i].x - nodes[j].x, dy = nodes[i].y - nodes[j].y;
-      let d2 = dx * dx + dy * dy || 0.01;
-      if (d2 > 90000) continue; // ignore far pairs for speed
-      const d = Math.sqrt(d2);
-      const f = (k * k) / d;
-      fx += (dx / d) * f * 0.02;
-      fy += (dy / d) * f * 0.02;
-    }
-    nodes[i].vx += fx; nodes[i].vy += fy;
-  }
-  for (const [a, b] of edgeIdx) {
-    const dx = nodes[b].x - nodes[a].x, dy = nodes[b].y - nodes[a].y;
-    const d = Math.sqrt(dx * dx + dy * dy) || 0.01;
-    const f = (d - k) * 0.01;
-    nodes[a].vx += (dx / d) * f; nodes[a].vy += (dy / d) * f;
-    nodes[b].vx -= (dx / d) * f; nodes[b].vy -= (dy / d) * f;
-  }
-  for (const n of nodes) {
-    n.vx += (width / 2 - n.x) * 0.0015;
-    n.vy += (height / 2 - n.y) * 0.0015;
-    n.x += n.vx *= 0.82;
-    n.y += n.vy *= 0.82;
-  }
-}
-
-const edgeEls = edges.map(e => {
+const edgeEls = rawEdges.map(e => {
+  const a = byId.get(e.from), b = byId.get(e.to);
   const el = document.createElementNS(NS, 'path');
   el.setAttribute('class', 'edge');
+  if (a && b) el.setAttribute('d', 'M' + a.x + ',' + a.y + ' L' + b.x + ',' + b.y);
   viewport.appendChild(el);
   return { e, el };
 });
 const nodeEls = nodes.map(n => {
   const g = document.createElementNS(NS, 'g');
-  g.setAttribute('class', 'node');
+  g.setAttribute('class', 'node' + (n.degree >= hubThreshold ? ' hub' : ''));
+  g.setAttribute('transform', 'translate(' + n.x + ',' + n.y + ')');
   const c = document.createElementNS(NS, 'circle');
-  c.setAttribute('r', 4 + Math.min(10, edges.filter(e => e.from === n.id || e.to === n.id).length * 0.3));
+  c.setAttribute('r', String(3 + Math.min(10, Math.sqrt(n.degree + 1) * 2)));
   c.setAttribute('fill', colorFor(n.service));
   const t = document.createElementNS(NS, 'text');
   t.textContent = n.id;
-  t.setAttribute('x', 7);
-  t.setAttribute('y', 3);
+  t.setAttribute('x', '7'); t.setAttribute('y', '3');
   g.appendChild(c); g.appendChild(t);
   viewport.appendChild(g);
-  g.addEventListener('click', () => highlight(n.id));
+  g.addEventListener('click', (ev) => { ev.stopPropagation(); highlight(n.id); });
   return { n, g };
 });
-
-function render() {
-  for (const { e, el } of edgeEls) {
-    const a = byId.get(e.from), b = byId.get(e.to);
-    if (!a || !b) continue;
-    el.setAttribute('d', 'M' + a.x + ',' + a.y + ' L' + b.x + ',' + b.y);
-  }
-  for (const { n, g } of nodeEls) {
-    g.setAttribute('transform', 'translate(' + n.x + ',' + n.y + ')');
-  }
-}
-render();
 
 let highlighted = null;
 function highlight(id) {
@@ -152,40 +183,46 @@ function highlight(id) {
     el.classList.toggle('dim', !!highlighted && !on);
   }
   for (const { n, g } of nodeEls) {
-    const on = !highlighted || n.id === highlighted || edges.some(e =>
+    const on = !highlighted || n.id === highlighted || rawEdges.some(e =>
       (e.from === highlighted && e.to === n.id) || (e.to === highlighted && e.from === n.id));
     g.classList.toggle('dim', !on);
+    g.classList.toggle('hi', n.id === highlighted);
   }
 }
+svg.addEventListener('click', () => { if (highlighted) highlight(highlighted); });
 
 document.getElementById('search').addEventListener('input', (ev) => {
   const q = ev.target.value.trim().toUpperCase();
   for (const { n, g } of nodeEls) {
-    const match = !q || n.id.includes(q) || (n.service ?? '').toUpperCase().includes(q);
-    g.classList.toggle('dim', !match);
+    const match = !!q && (n.id.includes(q) || (n.service ?? '').toUpperCase().includes(q));
+    g.classList.toggle('dim', !!q && !match);
+    g.classList.toggle('match', match);
   }
   for (const { e, el } of edgeEls) {
     const match = !q || e.from.includes(q) || e.to.includes(q) || (e.label ?? '').toUpperCase().includes(q);
-    el.classList.toggle('dim', !match);
+    el.classList.toggle('dim', !!q && !match);
   }
 });
 
 // pan/zoom
-let tx = 0, ty = 0, scale = 0.55, dragging = false, lastX = 0, lastY = 0;
+let tx = 0, ty = 0, scale = Math.max(0.15, Math.min(0.85, 700 / (260 + Math.sqrt(nodes.length) * 26)));
+let dragging = false, lastX = 0, lastY = 0, moved = false;
 function applyTransform() { viewport.setAttribute('transform', 'translate(' + tx + ',' + ty + ') scale(' + scale + ')'); }
+tx = window.innerWidth / 2; ty = window.innerHeight / 2;
 applyTransform();
-svg.addEventListener('mousedown', (ev) => { dragging = true; lastX = ev.clientX; lastY = ev.clientY; });
-window.addEventListener('mouseup', () => dragging = false);
+svg.addEventListener('mousedown', (ev) => { dragging = true; moved = false; lastX = ev.clientX; lastY = ev.clientY; svg.classList.add('dragging'); });
+window.addEventListener('mouseup', () => { dragging = false; svg.classList.remove('dragging'); });
 window.addEventListener('mousemove', (ev) => {
   if (!dragging) return;
   tx += ev.clientX - lastX; ty += ev.clientY - lastY;
   lastX = ev.clientX; lastY = ev.clientY;
+  moved = true;
   applyTransform();
 });
 svg.addEventListener('wheel', (ev) => {
   ev.preventDefault();
-  const factor = ev.deltaY < 0 ? 1.1 : 0.9;
-  scale = Math.max(0.05, Math.min(4, scale * factor));
+  const factor = ev.deltaY < 0 ? 1.12 : 0.89;
+  scale = Math.max(0.03, Math.min(6, scale * factor));
   applyTransform();
 }, { passive: false });
 </script>
