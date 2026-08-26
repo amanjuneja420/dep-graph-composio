@@ -143,12 +143,28 @@ function resolveRef(schema: JSONSchema, defs: Record<string, JSONSchema>): JSONS
 type LeafOccurrence = { leaf: string; entity: string | undefined };
 
 /**
+ * Response-wrapper defs (e.g. `GetAnIssueResponse`, `ListRepositoryIssuesResponseWrapper`)
+ * are named after the ACTION, not an entity -- treating their title as an entity would tag
+ * every field on a tool's own response root with a near-unique per-tool "entity" (defeating
+ * the whole point of entity qualification: those wrapper titles never recur, so leaves tagged
+ * with them look artificially "distinctive" and real cross-tool matching never fires). Only a
+ * handful of boilerplate suffixes need filtering -- this is generic API-shape knowledge (every
+ * REST/RPC codegen names its envelope types this way), not toolkit-specific vocabulary.
+ */
+const WRAPPER_TITLE_RE = /_(response_wrapper|response|request|wrapper)$/;
+function titleToEntity(title: string | undefined): string | undefined {
+  if (!title) return undefined;
+  const snake = toSnake(title);
+  return WRAPPER_TITLE_RE.test(snake) ? undefined : snake;
+}
+
+/**
  * Walk a tool's outputParameters and collect every scalar leaf field it produces, tagged with
  * the entity it belongs to when we can tell (from the nearest enclosing $ref's own title --
  * never from the property key, so this needs no fixed vocabulary at all). Fields sitting
- * directly on the tool's own response root (depth 0, e.g. a `GET_AN_ISSUE`-style endpoint
- * that returns the entity inline rather than nested) have no title-derived entity; the caller
- * fills that in from the tool's slug once the catalog-wide entity vocabulary is known.
+ * directly on the tool's own response root, or nested under a response-wrapper-shaped def
+ * rather than a real named entity, have no title-derived entity; the caller fills that in
+ * from the tool's slug once the catalog-wide entity vocabulary is known.
  */
 function walkOutputLeaves(tool: Tool): LeafOccurrence[] {
   const out: JSONSchema = tool.outputParameters;
@@ -161,11 +177,11 @@ function walkOutputLeaves(tool: Tool): LeafOccurrence[] {
     if (!node || depth > 4 || seenPaths.has(path)) return;
     seenPaths.add(path);
     const resolved = resolveRef(node, defs);
-    const entityFromTitle = depth > 0 && resolved.title ? toSnake(resolved.title) : entityCtx;
+    const entityFromTitle = depth > 0 ? (titleToEntity(resolved.title) ?? entityCtx) : entityCtx;
 
     if (resolved.type === "array" && resolved.items) {
       const itemsResolved = resolveRef(resolved.items, defs);
-      const itemEntity = itemsResolved.title ? toSnake(itemsResolved.title) : entityFromTitle;
+      const itemEntity = titleToEntity(itemsResolved.title) ?? entityFromTitle;
       walk(itemsResolved, itemEntity, depth + 1, path + "[]");
       return;
     }
@@ -294,9 +310,14 @@ function buildHeuristicEdges(tools: Tool[], vocab: CatalogVocabulary): Candidate
     const rootEntities = entitiesFromSlug(slug, vocab);
     for (const { leaf, entity } of walkOutputLeaves(tool)) {
       const resolvedEntities = entity ? [entity] : rootEntities;
-      if (resolvedEntities.length === 0 && !vocab.distinctiveLeaves.has(leaf)) continue;
+      if (resolvedEntities.length === 0 && !(entity && vocab.distinctiveLeaves.has(leaf))) continue;
       for (const e of resolvedEntities) register(leaf, e, slug);
-      if (vocab.distinctiveLeaves.has(leaf)) register(leaf, undefined, slug);
+      // Bare/unqualified registration requires THIS occurrence to have come from a genuine
+      // schema entity context (nested under a real $ref-titled object), not merely a
+      // slug-inferred one and not a value sitting bare on some other tool's response root
+      // (e.g. many wrapper responses echo request context like `repo`/`org` back verbatim --
+      // that's not a "look this up first" relationship, just incidental field-name reuse).
+      if (entity && vocab.distinctiveLeaves.has(leaf)) register(leaf, undefined, slug);
     }
   }
 

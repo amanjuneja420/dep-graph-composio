@@ -17,22 +17,30 @@ shared vocabulary from the schemas themselves, in two passes.
 (resolving `$ref`/`$defs`, including array items and nested objects), and record every scalar
 leaf field, tagged with the entity it belongs to when the schema tells us (the nearest
 enclosing `$ref`'s own `title` — e.g. a `number` field found while walking into an `Issue`
-def is tagged `entity: "issue"`). Two things come out of this pass:
-- `entities`: the set of all entity titles seen, catalog-wide (`issue`, `pull_request`,
-  `milestone`, ... — or, for a different toolkit entirely, whatever nouns *that* catalog uses).
-- `distinctiveLeaves`: leaf names that appear under very few (≤2) distinct entities catalog-wide.
-  A leaf like `id` or `name` appears under dozens of entities and is useless unqualified; a leaf
-  like `tag_name` or `sha` appears under one or two and is safe to match on its own.
+def is tagged `entity: "issue"`). Response-wrapper defs (named after the action, e.g.
+`GetAnIssueResponse`, matched by a small boilerplate-suffix filter — `_response`,
+`_response_wrapper`, `_request`, `_wrapper`) are deliberately **not** treated as entities: a
+field sitting directly on a tool's own response root has no title-derived entity at all and
+falls through to the tool's-own-slug fallback in pass 2 instead. Two things come out of pass 1:
+- `entities`: the set of all real (non-wrapper) entity titles seen, catalog-wide (`issue`,
+  `pull_request`, `milestone`, ... — or, for a different toolkit entirely, whatever nouns
+  *that* catalog uses).
+- `distinctiveLeaves`: leaf names that appear under very few (≤2) distinct entities catalog-wide,
+  counting only genuinely entity-tagged occurrences. A leaf like `id` or `name` appears under
+  dozens of entities and is useless unqualified; a leaf like `tag_name` appears under one or
+  two and is safe to match on its own.
 
 **Pass 2 — match.** For each tool's required input field, try two things against the pass-1
 index:
-1. **Bare match** — the field name exactly equals a *distinctive* leaf key somewhere in the
-   catalog (covers `sha`, `ref`, `tag_name`, or a compound field like `assignee_id` that some
-   entity exposes directly).
+1. **Bare match** — the field name exactly equals a *distinctive* leaf key, and specifically
+   one that was registered from a genuine nested-entity occurrence (not merely echoed onto
+   some other tool's response root — see "why bare matching is restricted" below).
 2. **Qualified match** — split the field at its last underscore (`issue_number` → prefix
    `issue`, leaf `number`); if the prefix fuzzily names an entity that produced that leaf
    (`entityMatchesWord`: exact token match, or the entity's joined tokens start with the
-   prefix — `repo` vs. `repository`, `pull` vs. `pull_request`), it's a candidate.
+   prefix — `repo` vs. `repository`, `pull` vs. `pull_request`), it's a candidate. (`commit_sha`,
+   `head_sha`, `tag_sha` etc. all resolve this way rather than via a bare `sha` match — more
+   precise, since `sha` alone recurs under too many different entity types to be distinctive.)
 
 Neither step uses a fixed dictionary of GitHub nouns. `fixtures/fake_toolkit_catalog.json` is a
 7-tool, zero-GitHub-vocabulary fake "Linear" catalog (tickets, projects, assignees) committed
@@ -53,9 +61,25 @@ An early version with no cap on producers-per-field produced 8515 edges on the G
 extremely common fields like `repository_id` were matching hundreds of producers, drowning the
 useful signal in noise. `MAX_PRODUCERS_PER_FIELD = 6`, preferring read-style tools
 (list/get/search/find/query — a tool you'd naturally call *first* to discover a value) over
-mutations, brought that down to ~2500–2650 edges with much better signal-to-noise, while still
-allowing multiple legitimate ways to obtain a value (matching the README's own note that
+mutations, brought that down to a few thousand edges with much better signal-to-noise, while
+still allowing multiple legitimate ways to obtain a value (matching the README's own note that
 `issue_number` "could [come from] other ways too").
+
+## Why bare/unqualified matching is restricted to genuine entity occurrences
+
+A subtler noise source, caught during review: many response-wrapper roots *echo request
+context back verbatim* — e.g. a workflow-run cancellation response happens to include a flat
+`repo` field alongside its own result, not because "repo" is something you'd look up, but
+because the API echoes it. Once `repo` cleared the distinctiveness bar (from a couple of real
+entities like `BranchInfo` that genuinely have a `repo` field), an earlier version of pass 2
+registered *every* tool where `repo` appeared anywhere — including these root-level echoes —
+as a bare producer, producing over 2600 near-meaningless `X → Y (repo)` edges (every
+`repo`-requiring tool matching against a handful of unrelated producers that merely happened
+to echo the field). The fix: bare/unqualified registration now requires *this specific
+occurrence* to have come from a genuine nested-entity context, not a root-level echo or a
+slug-inferred one. Qualified (`entity_leaf`) registration is unaffected and still uses the
+slug-inferred fallback for root-level fields, since that's a deliberate, weaker-but-labeled
+inference rather than an accidental one.
 
 ## The LLM refinement pass (implemented, not live-verified)
 

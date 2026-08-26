@@ -18,7 +18,9 @@ Commits so far:
 
 The deliverable (generator at src/generate.ts) is FUNCTIONALLY COMPLETE and passes the
 grader's gates:
-  - `npm run selfcheck` -> 893 nodes, 2654 edges, provenance_ratio 1.0, labeled_edges 2654
+  - `npm run selfcheck` -> 893 nodes, 3539 edges, provenance_ratio 1.0, labeled_edges 3539
+    (this number moved twice during this session as real bugs got fixed post-advisor-review;
+    see IMPORTANT REWRITE and the commit trail if a stale number shows up somewhere)
   - Both README example chains verified present and correct:
       GITHUB_LIST_REPOSITORY_ISSUES -> GITHUB_CREATE_AN_ISSUE_COMMENT   (label: issue_number)
       GITHUB_LIST_PULL_REQUESTS     -> GITHUB_MERGE_A_PULL_REQUEST      (label: pull_number)
@@ -46,6 +48,24 @@ and it correctly produces 10 edges (e.g. LINEAR_LIST_PROJECTS -> LINEAR_LIST_TIC
 project_id) from a schema shape the code has never seen. This fixture is the actual evidence
 for the generalization claim — don't delete it.
 
+A SECOND advisor review of that same rewrite caught a follow-up bug (also fixed, also see
+DESIGN.md): response-WRAPPER titles (e.g. `GetAnIssueResponse`) were initially being treated
+as entities too, which (a) polluted the entity vocabulary with ~900 one-off pseudo-entities
+and (b) made genuinely distinctive leaves like `sha`/`ref`/`login` look "generic" (since they
+got miscounted as appearing under many entities) so bare matching silently stopped firing
+entirely -- edge count went UP (2528->2654) even though the mechanism was broken, which is
+why "more edges" alone isn't proof of correctness. Filtered wrapper titles out via
+WRAPPER_TITLE_RE. That surfaced a THIRD, smaller issue: once a field like `repo` cleared the
+distinctiveness bar via 2-3 real entities, root-level "echoed" occurrences (a field that just
+happens to sit on some unrelated tool's response root, not nested under any real entity) were
+still being bare-registered as producers, producing 2600+ near-meaningless `repo`/`org` edges.
+Fixed by requiring bare registration to come from a genuine entity-tagged occurrence, not a
+root-level echo. Final, doubly-reviewed number: 3539 edges. If you're continuing this and the
+edge count changes again, re-run the advisor / a fresh skeptical pass on the label histogram
+before trusting a "looks more complete" number -- see DESIGN.md's whole "Why bare matching is
+restricted" section for the exact debugging method (compare label histograms, check bare vs.
+qualified edge counts, spot-check a random sample, not just the two README examples).
+
 HOW THE GENERATOR WORKS (src/generate.ts)
 -------------------------------------------
 Full rationale in DESIGN.md. Summary:
@@ -71,7 +91,7 @@ Full rationale in DESIGN.md. Summary:
    - CAPS producers per (consumer, field) at 6 — preferring list/get/search/find/query-verb
      tools first (more natural "precursor" actions) — because without a cap, extremely common
      fields like `repository_id` were matching 1000+ producers and drowning the graph in
-     low-value edges (first uncapped attempt: 8515 edges; capped: ~2650, much better
+     low-value edges (first uncapped attempt: 8515 edges; final: 3539, much better
      signal-to-noise).
    - `inferService(slug, vocab)` reuses `entitiesFromSlug` for the optional Node.service field.
    - PROVEN to generalize (not just claimed): `fixtures/fake_toolkit_catalog.json` is a
